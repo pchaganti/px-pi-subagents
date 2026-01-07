@@ -110,6 +110,12 @@ interface Details {
 
 type DisplayItem = { type: "text"; text: string } | { type: "tool"; name: string; args: Record<string, unknown> };
 
+interface TokenUsage {
+	input: number;
+	output: number;
+	total: number;
+}
+
 interface AsyncStatus {
 	runId: string;
 	mode: "single" | "chain";
@@ -118,7 +124,10 @@ interface AsyncStatus {
 	endedAt?: number;
 	lastUpdate?: number;
 	currentStep?: number;
-	steps?: Array<{ agent: string; status: string; durationMs?: number }>;
+	steps?: Array<{ agent: string; status: string; durationMs?: number; tokens?: TokenUsage }>;
+	sessionDir?: string;
+	outputFile?: string;
+	totalTokens?: TokenUsage;
 	sessionFile?: string;
 	shareUrl?: string;
 	shareError?: string;
@@ -134,6 +143,9 @@ interface AsyncJobState {
 	stepsTotal?: number;
 	startedAt?: number;
 	updatedAt?: number;
+	sessionDir?: string;
+	outputFile?: string;
+	totalTokens?: TokenUsage;
 	sessionFile?: string;
 	shareUrl?: string;
 }
@@ -171,6 +183,44 @@ function readStatus(asyncDir: string): AsyncStatus | null {
 	}
 }
 
+function getOutputTail(outputFile: string | undefined, maxLines: number = 3): string[] {
+	if (!outputFile || !fs.existsSync(outputFile)) return [];
+	let fd: number | null = null;
+	try {
+		const stat = fs.statSync(outputFile);
+		if (stat.size === 0) return [];
+		const tailBytes = 4096;
+		const start = Math.max(0, stat.size - tailBytes);
+		fd = fs.openSync(outputFile, "r");
+		const buffer = Buffer.alloc(Math.min(tailBytes, stat.size));
+		fs.readSync(fd, buffer, 0, buffer.length, start);
+		const content = buffer.toString("utf-8");
+		const lines = content.split("\n").filter((l) => l.trim());
+		return lines.slice(-maxLines).map((l) => l.slice(0, 80) + (l.length > 80 ? "..." : ""));
+	} catch {
+		return [];
+	} finally {
+		if (fd !== null) {
+			try {
+				fs.closeSync(fd);
+			} catch {}
+		}
+	}
+}
+
+function getLastActivity(outputFile: string | undefined): string {
+	if (!outputFile || !fs.existsSync(outputFile)) return "";
+	try {
+		const stat = fs.statSync(outputFile);
+		const ago = Date.now() - stat.mtimeMs;
+		if (ago < 1000) return "active now";
+		if (ago < 60000) return `active ${Math.floor(ago / 1000)}s ago`;
+		return `active ${Math.floor(ago / 60000)}m ago`;
+	} catch {
+		return "";
+	}
+}
+
 function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void {
 	if (!ctx.hasUI) return;
 	if (jobs.length === 0) {
@@ -194,12 +244,22 @@ function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void {
 		const stepsTotal = job.stepsTotal ?? (job.agents?.length ?? 1);
 		const stepIndex = job.currentStep !== undefined ? job.currentStep + 1 : undefined;
 		const stepText = stepIndex !== undefined ? `step ${stepIndex}/${stepsTotal}` : `steps ${stepsTotal}`;
-		const mode = job.mode ?? (stepsTotal > 1 ? "chain" : "single");
-		const endTime = (job.status === "complete" || job.status === "failed") ? job.updatedAt : Date.now();
+		const endTime = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? Date.now()) : Date.now();
 		const elapsed = job.startedAt ? formatDuration(endTime - job.startedAt) : "";
-		const agentLabel = job.agents ? job.agents.join(" -> ") : mode;
+		const agentLabel = job.agents ? job.agents.join(" -> ") : (job.mode ?? "single");
 
-		lines.push(`- ${id} ${status} | ${agentLabel} | ${stepText}${elapsed ? ` | ${elapsed}` : ""}`);
+		const tokenText = job.totalTokens ? ` | ${formatTokens(job.totalTokens.total)} tok` : "";
+		const activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
+		const activitySuffix = activityText ? ` | ${theme.fg("dim", activityText)}` : "";
+
+		lines.push(`- ${id} ${status} | ${agentLabel} | ${stepText}${elapsed ? ` | ${elapsed}` : ""}${tokenText}${activitySuffix}`);
+
+		if (job.status === "running" && job.outputFile) {
+			const tail = getOutputTail(job.outputFile, 3);
+			for (const line of tail) {
+				lines.push(theme.fg("dim", `  > ${line}`));
+			}
+		}
 	}
 
 	ctx.ui.setWidget(WIDGET_KEY, lines);
@@ -767,6 +827,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const tempArtifactsDir = getArtifactsDir(null);
 	cleanupOldArtifacts(tempArtifactsDir, DEFAULT_ARTIFACT_CONFIG.cleanupDays);
 	let baseCwd = process.cwd();
+	let currentSessionId: string | null = null;
 	const asyncJobs = new Map<string, AsyncJobState>();
 	let lastUiContext: ExtensionContext | null = null;
 	let poller: NodeJS.Timeout | null = null;
@@ -794,6 +855,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					if (status.steps?.length) {
 						job.agents = status.steps.map((step) => step.agent);
 					}
+					job.sessionDir = status.sessionDir ?? job.sessionDir;
+					job.outputFile = status.outputFile ?? job.outputFile;
+					job.totalTokens = status.totalTokens ?? job.totalTokens;
 					job.sessionFile = status.sessionFile ?? job.sessionFile;
 					job.shareUrl = status.shareUrl ?? job.shareUrl;
 				} else {
@@ -811,7 +875,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (!fs.existsSync(p)) return;
 		try {
 			const data = JSON.parse(fs.readFileSync(p, "utf-8"));
-			if (data.cwd && data.cwd !== baseCwd) return;
+			if (data.sessionId && data.sessionId !== currentSessionId) return;
+			if (!data.sessionId && data.cwd && data.cwd !== baseCwd) return;
 			pi.events.emit("subagent:complete", data);
 			pi.events.emit("subagent_enhanced:complete", data);
 			fs.unlinkSync(p);
@@ -834,6 +899,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		async execute(_id, params, onUpdate, ctx, signal) {
 			const scope: AgentScope = params.agentScope ?? "user";
 			baseCwd = ctx.cwd;
+			currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 			const agents = discoverAgents(ctx.cwd, scope).agents;
 			const runId = randomUUID().slice(0, 8);
 			const shareEnabled = params.share !== false;
@@ -932,6 +998,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							share: shareEnabled,
 							sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
 							asyncDir,
+							sessionId: currentSessionId,
 						},
 						id,
 					);
@@ -993,6 +1060,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 							share: shareEnabled,
 							sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
 							asyncDir,
+							sessionId: currentSessionId,
 						},
 						id,
 					);
@@ -1436,6 +1504,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (!info.id) return;
 		const asyncDir = info.asyncDir ?? path.join(ASYNC_DIR, info.id);
 		const agents = info.chain && info.chain.length > 0 ? info.chain : info.agent ? [info.agent] : undefined;
+		const now = Date.now();
 		asyncJobs.set(info.id, {
 			asyncId: info.id,
 			asyncDir,
@@ -1443,7 +1512,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			mode: info.chain ? "chain" : "single",
 			agents,
 			stepsTotal: agents?.length,
-			startedAt: Date.now(),
+			startedAt: now,
+			updatedAt: now,
 		});
 		if (lastUiContext) {
 			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
@@ -1482,9 +1552,30 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		baseCwd = ctx.cwd;
+		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		asyncJobs.clear();
+		if (ctx.hasUI) {
+			lastUiContext = ctx;
+			renderWidget(ctx, []);
+		}
 	});
 	pi.on("session_switch", (_event, ctx) => {
 		baseCwd = ctx.cwd;
+		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		asyncJobs.clear();
+		if (ctx.hasUI) {
+			lastUiContext = ctx;
+			renderWidget(ctx, []);
+		}
+	});
+	pi.on("session_branch", (_event, ctx) => {
+		baseCwd = ctx.cwd;
+		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		asyncJobs.clear();
+		if (ctx.hasUI) {
+			lastUiContext = ctx;
+			renderWidget(ctx, []);
+		}
 	});
 	pi.on("session_shutdown", () => {
 		watcher.close();

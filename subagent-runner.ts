@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
@@ -36,6 +36,7 @@ interface SubagentRunConfig {
 	share?: boolean;
 	sessionDir?: string;
 	asyncDir: string;
+	sessionId?: string | null;
 }
 
 interface StepResult {
@@ -60,6 +61,67 @@ function findLatestSessionFile(sessionDir: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+interface TokenUsage {
+	input: number;
+	output: number;
+	total: number;
+}
+
+function parseSessionTokens(sessionDir: string): TokenUsage | null {
+	const sessionFile = findLatestSessionFile(sessionDir);
+	if (!sessionFile) return null;
+	try {
+		const content = fs.readFileSync(sessionFile, "utf-8");
+		let input = 0;
+		let output = 0;
+		for (const line of content.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line);
+				if (entry.usage) {
+					input += entry.usage.inputTokens ?? entry.usage.input ?? 0;
+					output += entry.usage.outputTokens ?? entry.usage.output ?? 0;
+				}
+			} catch {}
+		}
+		return { input, output, total: input + output };
+	} catch {
+		return null;
+	}
+}
+
+function runPiStreaming(
+	args: string[],
+	cwd: string,
+	outputFile: string,
+): Promise<{ stdout: string; exitCode: number | null }> {
+	return new Promise((resolve) => {
+		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
+		const child = spawn("pi", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+
+		child.stdout.on("data", (chunk: Buffer) => {
+			const text = chunk.toString();
+			stdout += text;
+			outputStream.write(text);
+		});
+
+		child.stderr.on("data", (chunk: Buffer) => {
+			outputStream.write(chunk.toString());
+		});
+
+		child.on("close", (exitCode) => {
+			outputStream.end();
+			resolve({ stdout, exitCode });
+		});
+
+		child.on("error", () => {
+			outputStream.end();
+			resolve({ stdout, exitCode: 1 });
+		});
+	});
 }
 
 async function exportSessionHtml(sessionFile: string, outputDir: string): Promise<string> {
@@ -179,7 +241,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const statusPath = path.join(asyncDir, "status.json");
 	const eventsPath = path.join(asyncDir, "events.jsonl");
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
+	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
 
+	const outputFile = path.join(asyncDir, "output.log");
 	const statusPayload: {
 		runId: string;
 		mode: "single" | "chain";
@@ -198,8 +262,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			durationMs?: number;
 			exitCode?: number | null;
 			error?: string;
+			tokens?: TokenUsage;
 		}>;
 		artifactsDir?: string;
+		sessionDir?: string;
+		outputFile?: string;
+		totalTokens?: TokenUsage;
 		sessionFile?: string;
 		shareUrl?: string;
 		gistUrl?: string;
@@ -216,6 +284,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		currentStep: 0,
 		steps: steps.map((step) => ({ agent: step.agent, status: "pending" })),
 		artifactsDir,
+		sessionDir: config.sessionDir,
+		outputFile,
 	};
 
 	fs.mkdirSync(asyncDir, { recursive: true });
@@ -298,11 +368,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 		}
 
-		const result = spawnSync("pi", args, {
-			cwd: step.cwd ?? cwd,
-			encoding: "utf-8",
-			maxBuffer: 10 * 1024 * 1024,
-		});
+		const result = await runPiStreaming(args, step.cwd ?? cwd, outputFile);
 
 		if (tmpDir) {
 			try {
@@ -313,10 +379,22 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		const output = (result.stdout || "").trim();
 		previousOutput = output;
 
+		const cumulativeTokens = config.sessionDir ? parseSessionTokens(config.sessionDir) : null;
+		const stepTokens: TokenUsage | null = cumulativeTokens
+			? {
+					input: cumulativeTokens.input - previousCumulativeTokens.input,
+					output: cumulativeTokens.output - previousCumulativeTokens.output,
+					total: cumulativeTokens.total - previousCumulativeTokens.total,
+				}
+			: null;
+		if (cumulativeTokens) {
+			previousCumulativeTokens = cumulativeTokens;
+		}
+
 		const stepResult: StepResult = {
 			agent: step.agent,
 			output,
-			success: result.status === 0,
+			success: result.exitCode === 0,
 			artifactPaths,
 		};
 
@@ -333,7 +411,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							runId: id,
 							agent: step.agent,
 							task,
-							exitCode: result.status,
+							exitCode: result.exitCode,
 							durationMs: Date.now() - stepStartTime,
 							timestamp: Date.now(),
 						},
@@ -347,26 +425,31 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 		results.push(stepResult);
 		const stepEndTime = Date.now();
-		statusPayload.steps[stepIndex].status = result.status === 0 ? "complete" : "failed";
+		statusPayload.steps[stepIndex].status = result.exitCode === 0 ? "complete" : "failed";
 		statusPayload.steps[stepIndex].endedAt = stepEndTime;
 		statusPayload.steps[stepIndex].durationMs = stepEndTime - stepStartTime;
-		statusPayload.steps[stepIndex].exitCode = result.status;
+		statusPayload.steps[stepIndex].exitCode = result.exitCode;
+		if (stepTokens) {
+			statusPayload.steps[stepIndex].tokens = stepTokens;
+			statusPayload.totalTokens = { ...previousCumulativeTokens };
+		}
 		statusPayload.lastUpdate = stepEndTime;
 		writeJson(statusPath, statusPayload);
 		appendJsonl(
 			eventsPath,
 			JSON.stringify({
-				type: result.status === 0 ? "subagent.step.completed" : "subagent.step.failed",
+				type: result.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
 				ts: stepEndTime,
 				runId: id,
 				stepIndex,
 				agent: step.agent,
-				exitCode: result.status,
+				exitCode: result.exitCode,
 				durationMs: stepEndTime - stepStartTime,
+				tokens: stepTokens,
 			}),
 		);
 
-		if (result.status !== 0) break;
+		if (result.exitCode !== 0) break;
 	}
 
 	let summary = results.map((r) => `${r.agent}:\n${r.output}`).join("\n\n");
@@ -451,36 +534,41 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		shareError,
 	});
 
-	fs.mkdirSync(path.dirname(resultPath), { recursive: true });
-	fs.writeFileSync(
-		resultPath,
-		JSON.stringify({
-			id,
-			agent: agentName,
-			success: results.every((r) => r.success),
-			summary,
-			results: results.map((r) => ({
-				agent: r.agent,
-				output: r.output,
-				success: r.success,
-				artifactPaths: r.artifactPaths,
-				truncated: r.truncated,
-			})),
-			exitCode: results.every((r) => r.success) ? 0 : 1,
-			timestamp: Date.now(),
-			durationMs: Date.now() - overallStartTime,
-			truncated,
-			artifactsDir,
-			cwd,
-			asyncDir,
-			sessionFile,
-			shareUrl,
-			gistUrl,
-			shareError,
-			...(taskIndex !== undefined && { taskIndex }),
-			...(totalTasks !== undefined && { totalTasks }),
-		}),
-	);
+	try {
+		fs.mkdirSync(path.dirname(resultPath), { recursive: true });
+		fs.writeFileSync(
+			resultPath,
+			JSON.stringify({
+				id,
+				agent: agentName,
+				success: results.every((r) => r.success),
+				summary,
+				results: results.map((r) => ({
+					agent: r.agent,
+					output: r.output,
+					success: r.success,
+					artifactPaths: r.artifactPaths,
+					truncated: r.truncated,
+				})),
+				exitCode: results.every((r) => r.success) ? 0 : 1,
+				timestamp: runEndedAt,
+				durationMs: runEndedAt - overallStartTime,
+				truncated,
+				artifactsDir,
+				cwd,
+				asyncDir,
+				sessionId: config.sessionId,
+				sessionFile,
+				shareUrl,
+				gistUrl,
+				shareError,
+				...(taskIndex !== undefined && { taskIndex }),
+				...(totalTasks !== undefined && { totalTasks }),
+			}),
+		);
+	} catch (err) {
+		console.error(`Failed to write result file ${resultPath}:`, err);
+	}
 }
 
 const configArg = process.argv[2];
